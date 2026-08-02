@@ -22,7 +22,7 @@ from rag_core import (
     CONFIG, MiniBM25,  # noqa: F401  (MiniBM25 must be imported so pickle can find the class)
     retrieve_top_k_hybrid, rerank_candidates,
     build_context_package, build_chat_prompt, generate_answer,
-    detect_language, translate_to_english, translate_to_arabic,
+    correct_user_query, detect_language, translate_to_english, translate_to_arabic,
     expand_query,
 )
 
@@ -455,6 +455,11 @@ def render_sidebar(chunk_count):
 # RAG pipeline (uses the pre-built index from data/ via rag_core)
 # ======================================================================
 def answer_question(question, index, embedding_model, reranker):
+    # طبقة تصحيح إملائي/نحوي دائمة — بتشتغل على كل سؤال قبل أي حاجة تانية،
+    # وبصمت (من غير ما تظهر للمستخدم إن السؤال اتصحح).
+    corrected_question, _ = correct_user_query(question, use_llm=True)
+    question = corrected_question or question
+
     lang = detect_language(question)
     retrieval_query = translate_to_english(question) if lang != "en" else question
     expanded_query = expand_query(retrieval_query)
