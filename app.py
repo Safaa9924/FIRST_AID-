@@ -371,7 +371,7 @@ PULSE_SVG = (
 FIRST_AID_TOPICS = [
     ("🩸", "نزيف", "ما هي الخطوات الصحيحة للسيطرة على النزيف وإسعافه؟"),
     ("🔥", "حروق", "كيف يتم التعامل الصحيح مع إصابات الحروق؟"),
-    ("🫁", "اختناق", "اتعامل ازاى مع اختناق التنفس"),
+    ("🫁", "اختناق", "الاختناق"),
     ("❤️", "إنعاش قلبي (CPR)", "ما هي خطوات الإنعاش القلبي الرئوي (CPR) الصحيحة؟"),
     ("🦴", "كسور", "كيف أتعامل مع حالة اشتباه في وجود كسر؟"),
     ("🐝", "لسعات وحساسية", "ما هو الإسعاف الأولي للسعات الحشرات وردود الفعل التحسسية؟"),
@@ -379,7 +379,8 @@ FIRST_AID_TOPICS = [
 
 
 def render_sources(sources_payload):
-    """جدول بالمصادر: الترتيب، القسم، الصفحة، الدرجة، الثقة — زي النسخة الأولى."""
+    """جدول بالمصادر: الترتيب، القسم، الصفحة، الدرجة، الثقة — زي النسخة الأولى.
+    وبيعرض صورة الصفحة كمان لو كانت متاحة."""
     if not sources_payload:
         return
     table_rows = []
@@ -393,10 +394,31 @@ def render_sources(sources_payload):
         })
     sources_df = pd.DataFrame(table_rows)
     st.dataframe(sources_df, hide_index=True, use_container_width=True)
+
     with st.expander("📄 نص المقاطع كاملًا"):
         for i, s in enumerate(sources_payload, start=1):
             st.markdown(f"**{i}. {s['section']}** — صفحة {s['page_number'] or '—'}")
             st.write(s["text"])
+
+    # صور الصفحات المصدرية (لو موجودة فعليًا وأتاحها build_index.py)
+    shown_pages = set()
+    image_cols_data = []
+    for s in sources_payload:
+        page = s["page_number"]
+        images = s.get("images") or []
+        if page is None or page in shown_pages or not images:
+            continue
+        shown_pages.add(page)
+        img_path = images[0]
+        if os.path.exists(img_path):
+            image_cols_data.append((img_path, page))
+
+    if image_cols_data:
+        with st.expander(f"🖼️ صور الصفحات ({len(image_cols_data)})"):
+            cols = st.columns(min(3, len(image_cols_data)))
+            for i, (img_path, page) in enumerate(image_cols_data):
+                with cols[i % len(cols)]:
+                    st.image(img_path, caption=f"صفحة {page}", use_container_width=True)
 
 
 def render_hero():
@@ -476,9 +498,9 @@ def render_sidebar(chunk_count):
 # RAG pipeline (uses the pre-built index from data/ via rag_core)
 # ======================================================================
 def answer_question(question, index, embedding_model, reranker):
-    # طبقة تصحيح إملائي/نحوي دائمة — بتشتغل على كل سؤال قبل أي حاجة تانية،
-    # وبصمت (من غير ما تظهر للمستخدم إن السؤال اتصحح).
-    corrected_question, _ = correct_user_query(question, use_llm=True)
+    # طبقة تصحيح إملائي/نحوي دائمة — بتشتغل على كل سؤال قبل أي حاجة تانية.
+    corrected_question, was_corrected = correct_user_query(question, use_llm=True)
+    original_question = question
     question = corrected_question or question
 
     lang = detect_language(question)
@@ -492,14 +514,16 @@ def answer_question(question, index, embedding_model, reranker):
     reranked = rerank_candidates(expanded_query, candidates, reranker, top_n=TOP_N_RERANK)
     context = build_context_package(query=expanded_query, reranked_df=reranked)
 
+    correction_info = {"was_corrected": was_corrected, "original": original_question, "corrected": question}
+
     if context["num_sources"] == 0:
-        return None, None, [], "no_sources"
+        return None, None, [], "no_sources", correction_info
 
     prompt = build_chat_prompt(condition=question, context_text=context["context_text"])
     raw = generate_answer(prompt)
 
     if raw and raw.startswith("__LLM_ERROR__"):
-        return None, None, [], "llm_error"
+        return None, None, [], "llm_error", correction_info
 
     answer_en = raw
     answer_ar = translate_to_arabic(raw) if raw else None
@@ -509,16 +533,19 @@ def answer_question(question, index, embedding_model, reranker):
         for _, row in context["selected_df"].iterrows():
             page = row.get("page_number")
             score = row.get("rerank_score")
+            page_int = int(page) if pd.notna(page) and page != -1 else None
+            images = index["page_to_images"].get(page_int, []) if page_int is not None else []
             sources_payload.append({
                 "chunk_id": row.get("chunk_id", ""),
                 "section": row.get("section", "N/A"),
-                "page_number": int(page) if pd.notna(page) and page != -1 else None,
+                "page_number": page_int,
                 "score": float(score) if pd.notna(score) else None,
                 "confidence": confidence_label(score) if pd.notna(score) else "—",
                 "text": row["chunk_text"],
+                "images": images,
             })
 
-    return answer_en, answer_ar, sources_payload, None
+    return answer_en, answer_ar, sources_payload, None, correction_info
 
 
 # ======================================================================
@@ -593,9 +620,14 @@ def main():
 
         with st.chat_message("assistant", avatar="🚑"):
             with st.spinner("جارِ البحث عن أفضل إجابة..."):
-                answer_en, answer_ar, sources_payload, error = answer_question(
+                answer_en, answer_ar, sources_payload, error, correction_info = answer_question(
                     question, index, embedding_model, reranker
                 )
+
+            # دليل مرئي بسيط إن طبقة التصحيح فعلاً اشتغلت وغيّرت حاجة —
+            # بيظهر بس لو حصل تغيير فعلي، وبيتفضل مخفي لو السؤال كان سليم أصلًا.
+            if correction_info and correction_info.get("was_corrected"):
+                st.caption(f"✏️ تم تصحيح السؤال تلقائيًا إلى: *{correction_info['corrected']}*")
 
             if error == "no_sources":
                 msg_text = "معنديش معلومة موثوقة عن السؤال ده في المرجع، حاول تصيغه بشكل مختلف 🙏"
