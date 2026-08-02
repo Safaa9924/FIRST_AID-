@@ -23,7 +23,7 @@ from rag_core import (
     retrieve_top_k_hybrid, rerank_candidates,
     build_context_package, build_chat_prompt, generate_answer,
     correct_user_query, detect_language, translate_to_english, translate_to_arabic,
-    expand_query,
+    expand_query, confidence_label,
 )
 
 SITE_NAME = "نَبْضَة"
@@ -378,6 +378,27 @@ FIRST_AID_TOPICS = [
 ]
 
 
+def render_sources(sources_payload):
+    """جدول بالمصادر: الترتيب، القسم، الصفحة، الدرجة، الثقة — زي النسخة الأولى."""
+    if not sources_payload:
+        return
+    table_rows = []
+    for i, s in enumerate(sources_payload, start=1):
+        table_rows.append({
+            "الترتيب": i,
+            "القسم": s["section"],
+            "الصفحة": s["page_number"] if s["page_number"] is not None else "—",
+            "الدرجة": round(s["score"], 2) if s["score"] is not None else "—",
+            "الثقة": s["confidence"],
+        })
+    sources_df = pd.DataFrame(table_rows)
+    st.dataframe(sources_df, hide_index=True, use_container_width=True)
+    with st.expander("📄 نص المقاطع كاملًا"):
+        for i, s in enumerate(sources_payload, start=1):
+            st.markdown(f"**{i}. {s['section']}** — صفحة {s['page_number'] or '—'}")
+            st.write(s["text"])
+
+
 def render_hero():
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
     hero_html = (
@@ -486,8 +507,14 @@ def answer_question(question, index, embedding_model, reranker):
     sources_payload = []
     if context["num_sources"] > 0:
         for _, row in context["selected_df"].iterrows():
+            page = row.get("page_number")
+            score = row.get("rerank_score")
             sources_payload.append({
+                "chunk_id": row.get("chunk_id", ""),
                 "section": row.get("section", "N/A"),
+                "page_number": int(page) if pd.notna(page) and page != -1 else None,
+                "score": float(score) if pd.notna(score) else None,
+                "confidence": confidence_label(score) if pd.notna(score) else "—",
                 "text": row["chunk_text"],
             })
 
@@ -542,10 +569,8 @@ def main():
             else:
                 st.markdown(msg["content"])
             if msg.get("sources") and show_sources:
-                with st.expander("📚 المصادر المستخدمة"):
-                    for s in msg["sources"]:
-                        st.markdown(f"**{s['section']}**")
-                        st.write(s["text"])
+                st.markdown("**📚 المصادر**")
+                render_sources(msg["sources"])
 
     question = st.chat_input("اكتب سؤالك عن الإسعافات الأولية هنا...")
     if clicked_topic and not question:
@@ -588,10 +613,8 @@ def main():
                 st.markdown(answer_ar)
 
                 if sources_payload and show_sources:
-                    with st.expander("📚 المصادر المستخدمة"):
-                        for s in sources_payload:
-                            st.markdown(f"**{s['section']}**")
-                            st.write(s["text"])
+                    st.markdown("**📚 المصادر**")
+                    render_sources(sources_payload)
 
                 st.session_state.chat_history.append({
                     "role": "assistant",
