@@ -1,0 +1,7 @@
+# Only needed to run build_index.py locally, ONE TIME.
+# Do NOT put these in the deployed Streamlit app's requirements.txt —
+# they are heavy and unnecessary for answering questions.
+-r requirements.txt
+docling
+pymupdf
+wordfreq
