@@ -7,4 +7,4 @@ torchvision
 requests
 langdetect
 deep-translator
-pip install --upgrade transformers
+
