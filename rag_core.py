@@ -46,7 +46,7 @@ CONFIG = {
     "MAX_CONTEXT_CHUNKS": 8,
     "WORD_BUDGET": 1500,
     "MAX_CHUNK_WORDS_IN_CONTEXT": 180,
-    "MIN_CHUNK_SCORE": 0.0,
+    "MIN_CHUNK_SCORE": -1000,
 
     # ---------------- LLM ----------------
     # Two backends are supported:
