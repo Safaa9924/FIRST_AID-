@@ -15,6 +15,7 @@ import os
 import re
 import time
 from collections import Counter
+from difflib import SequenceMatcher
 
 import numpy as np
 import pandas as pd
@@ -233,24 +234,98 @@ def _call_llm(prompt, temperature=None, max_tokens=None, seed=None):
 # ============================================================
 # Query correction / language handling
 # ============================================================
+
+# قاموس بمصطلحات الإسعافات الأولية الشائعة بالعربي. بيستخدم في طبقة
+# تصحيح حتمية (deterministic) بتتفعل للأسئلة القصيرة (كلمة أو اتنين)،
+# وبتصحح بس لو التشابه قوي جدًا مع مصطلح معروف — عشان تمسك أخطاء زي
+# "اغماق" -> "إغماء" من غير ما تخمّن كلمات مختلفة تمامًا زي "أعماق".
+ARABIC_FIRST_AID_GLOSSARY = [
+    "نزيف", "نزيف حاد", "نزيف الأنف", "كسر", "كسر مفتوح", "حروق", "حرق كهربائي",
+    "حروق كيميائية", "اختناق", "انسداد مجرى التنفس", "إغماء", "فقدان الوعي",
+    "الإنعاش القلبي الرئوي", "دوخة", "لسعة حشرة", "حساسية", "صدمة تحسسية",
+    "صدمة كهربائية", "غرق", "تسمم", "جرعة زائدة", "سكتة دماغية", "ذبحة صدرية",
+    "نوبة قلبية", "صرع", "تشنجات", "ضربة شمس", "انخفاض حرارة الجسم", "قضمة الصقيع",
+    "جرح عميق", "التواء", "خلع مفصل", "إصابة الرأس", "إصابة العمود الفقري",
+    "اختناق بجسم غريب", "غيبوبة سكر", "هبوط سكر الدم", "لدغة ثعبان",
+]
+
+_GLOSSARY_MATCH_THRESHOLD = 0.55
+
+
+def _closest_glossary_term(text):
+    best_term, best_ratio = None, 0.0
+    for term in ARABIC_FIRST_AID_GLOSSARY:
+        ratio = SequenceMatcher(None, text, term).ratio()
+        if ratio > best_ratio:
+            best_ratio, best_term = ratio, term
+    return best_term, best_ratio
+
+
 def correct_user_query(query, use_llm=True):
+    stripped = query.strip()
+
+    # طبقة 1 — تصحيح حتمي (مش LLM) لمصطلحات شائعة: بتتفعل بس للأسئلة
+    # القصيرة جدًا (كلمة أو اتنين)، وبتصحح بس لو في تطابق قوي جدًا مع
+    # مصطلح معروف. سريعة، ثابتة، ومش محتاجة اتصال إنترنت.
+    if stripped and len(stripped.split()) <= 3:
+        glossary_term, ratio = _closest_glossary_term(stripped)
+        if glossary_term and ratio >= _GLOSSARY_MATCH_THRESHOLD and glossary_term != stripped:
+            return glossary_term, True
+
     if not use_llm:
         return query, False
 
     prompt = (
-        "Fix only spelling and grammar mistakes in the following first-aid "
-        "question. Do NOT change its meaning, do NOT answer it, do NOT add "
-        "information. If it is already correct, return it unchanged. "
-        "Return ONLY the corrected question, nothing else.\n\n"
-        f"Question: {query}"
+        "You are a strict spelling and grammar checker. You are NOT a first-aid "
+        "expert and you must NOT try to guess what the user 'probably meant'.\n\n"
+        "TASK: fix ONLY obvious spelling/typing mistakes in the text below.\n\n"
+        "STRICT RULES:\n"
+        "1. Do NOT change the meaning or topic in any way.\n"
+        "2. Do NOT invent a new question, and do NOT guess the user's intent.\n"
+        "3. Do NOT answer the question or add any information to it.\n"
+        "4. Keep the exact same language as the input (if it's Arabic, the output "
+        "must be Arabic; if English, output must be English).\n"
+        "5. If the text is unclear, nonsensical, a single ambiguous word, unrelated "
+        "to first aid, or you are not fully certain what to fix, return it EXACTLY "
+        "as given, character for character, with nothing changed.\n"
+        "6. Return ONLY the resulting text, nothing else — no explanation, no "
+        "quotation marks, no preamble.\n\n"
+        f"Text: {query}"
     )
     corrected = _call_llm(prompt, temperature=0.0, max_tokens=100)
     if corrected.startswith("__LLM_ERROR__"):
         return query, False
-    corrected = corrected.strip().strip('"')
-    if corrected and corrected.lower() != query.lower():
-        return corrected, True
-    return query, False
+
+    corrected = corrected.strip().strip('"').strip()
+    if not corrected or corrected.lower() == query.lower():
+        return query, False
+
+    # حماية 1 — حارس اللغة: ارفض أي "تصحيح" غيّر أبجدية النص بالكامل
+    # (يعني النموذج ترجم السؤال بدل ما يصحح إملاءه). نتحقق بعدّ نسبة
+    # الحروف العربية في كل نص بدل الاعتماد على langdetect (بيبقى غير
+    # موثوق مع الجمل القصيرة أو الكلمة الواحدة).
+    def _arabic_ratio(text):
+        letters = [c for c in text if c.isalpha()]
+        if not letters:
+            return 0.0
+        arabic = sum(1 for c in letters if "\u0600" <= c <= "\u06FF")
+        return arabic / len(letters)
+
+    orig_ratio = _arabic_ratio(query)
+    corr_ratio = _arabic_ratio(corrected)
+    # لو الأصل عربي بوضوح والناتج مبقاش عربي بوضوح (أو العكس) — ده مش
+    # تصحيح إملائي، ده تغيير لغة كامل. ارفضه.
+    if (orig_ratio > 0.5) != (corr_ratio > 0.5):
+        return query, False
+
+    # حماية 2 — لو الناتج مختلف جدًا عن السؤال الأصلي (يعني النموذج
+    # اخترع سؤال تاني بدل ما يصحح إملاء فعليًا)، نرفض "التصحيح" ونرجّع
+    # السؤال الأصلي زي ما هو بدل ما نغيّر قصد المستخدم.
+    similarity = SequenceMatcher(None, query.lower(), corrected.lower()).ratio()
+    if similarity < 0.45:
+        return query, False
+
+    return corrected, True
 
 
 def detect_language(text):
