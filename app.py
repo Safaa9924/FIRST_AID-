@@ -116,7 +116,13 @@ CUSTOM_CSS = """
         color: var(--ink);
     }
 
-    #MainMenu, footer, header {visibility: hidden;}
+    /* بنخفي قائمة Streamlit الافتراضية والفوتر بس — وبنسيب الـ header
+       شفاف (مش مخفي بالكامل) عشان زرار فتح/قفل القائمة الجانبية يفضل
+       شغال وظاهر. إخفاء الـ header بالكامل كان بيمنع فتح القائمة. */
+    #MainMenu, footer {visibility: hidden;}
+    header[data-testid="stHeader"] {
+        background: transparent;
+    }
 
     .stApp { background: var(--bg); }
 
