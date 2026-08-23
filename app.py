@@ -497,11 +497,9 @@ def render_sidebar(chunk_count):
 # ======================================================================
 # RAG pipeline (uses the pre-built index from data/ via rag_core)
 # ======================================================================
-import requests
-
 def generate_answer(prompt: str) -> str:
-    """توليد الإجابة باستخدام Groq API مع استخدام النموذج المتاح حالياً لتفادي خطأ 404."""
-    api_key = CONFIG.get("GROQ_API_KEY")
+    """توليد الإجابة مع استدعاء Groq API بشكل آمن لضمان عدم حدوث NameError."""
+    api_key = CONFIG.get("GROQ_API_KEY") or _get_api_key()
     if not api_key:
         return "__LLM_ERROR__: مفتاح Groq API غير متاح في الإعدادات."
 
@@ -511,8 +509,7 @@ def generate_answer(prompt: str) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        # تم تغيير النموذج القديم إلى الموديل الشغال حالياً على Groq
-        "model": "llama-3.1-8b-instant",
+        "model": "llama-3.1-8b-instant",  # الموديل المستقر والمدعوم حالياً على Groq
         "messages": [
             {
                 "role": "system",
