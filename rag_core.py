@@ -203,10 +203,15 @@ def _call_llm(prompt, temperature=None, max_tokens=None, seed=None):
                 },
                 timeout=60,
             )
+            if not response.ok:
+                # لوجز داخلية للمطور بس — الزائر مش بيشوفها خالص. تظهر
+                # في "Manage app" -> "Logs" على Streamlit Cloud.
+                print(f"[Nabda] Groq API error {response.status_code}: {response.text[:500]}")
             response.raise_for_status()
             data = response.json()
             return data["choices"][0]["message"]["content"].strip()
         except Exception as e:
+            print(f"[Nabda] Groq call failed: {e}")
             return f"__LLM_ERROR__:{e}"
 
     # Fallback: local Ollama server
