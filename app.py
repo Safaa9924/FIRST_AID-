@@ -522,8 +522,10 @@ def answer_question(question, index, embedding_model, reranker):
     prompt = build_chat_prompt(condition=question, context_text=context["context_text"])
     raw = generate_answer(prompt)
 
+    # إذا حدث خطأ في الـ LLM، نقوم باستخراج نص الخطأ المرفق ونمرره بدلاً من None
     if raw and raw.startswith("__LLM_ERROR__"):
-        return None, None, [], "llm_error", correction_info
+        err_details = raw.replace("__LLM_ERROR__:", "").strip()
+        return err_details, err_details, [], "llm_error", correction_info
 
     answer_en = raw
     answer_ar = translate_to_arabic(raw) if raw else None
