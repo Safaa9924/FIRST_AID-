@@ -571,6 +571,14 @@ def main():
     if api_key:
         CONFIG["GROQ_API_KEY"] = api_key
 
+    # لوجز تشخيصية للمطور بس (تظهر في Manage app -> Logs على
+    # Streamlit Cloud، مش في الموقع خالص) — بتأكد إن المفتاح والموديل
+    # بيتقروا صح من الـ Secrets من غير ما تكشف قيمة المفتاح نفسه.
+    print(
+        f"[Nabda] GROQ_API_KEY detected: {bool(api_key)} "
+        f"(len={len(api_key)}) | LLM_MODEL_NAME='{CONFIG['LLM_MODEL_NAME']}'"
+    )
+
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
