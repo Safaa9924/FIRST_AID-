@@ -46,7 +46,7 @@ CONFIG = {
     "MAX_CONTEXT_CHUNKS": 8,
     "WORD_BUDGET": 1500,
     "MAX_CHUNK_WORDS_IN_CONTEXT": 180,
-    "MIN_CHUNK_SCORE": 1.0,
+    "MIN_CHUNK_SCORE": 0.0,
 
     # ---------------- LLM ----------------
     # Two backends are supported:
@@ -448,6 +448,14 @@ def build_context_package(query, reranked_df, max_context_chunks=None, word_budg
 
     candidates = reranked_df[reranked_df["rerank_score"] >= min_chunk_score].copy()
     rejected_count = len(reranked_df) - len(candidates)
+
+    # لوج تشخيصي للمطور بس (Manage app -> Logs) — بيوريك أعلى درجات
+    # فعلية رجعها الـ reranker قبل الفلترة، عشان نتأكد العتبة (threshold)
+    # متظبطة صح مع النطاق الحقيقي للدرجات.
+    if not reranked_df.empty:
+        top_scores = reranked_df["rerank_score"].head(5).round(3).tolist()
+        print(f"[Nabda] query='{query[:60]}' top rerank scores={top_scores} "
+              f"threshold={min_chunk_score} kept={len(candidates)}/{len(reranked_df)}")
 
     if candidates.empty:
         return {
