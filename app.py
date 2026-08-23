@@ -497,37 +497,62 @@ def render_sidebar(chunk_count):
 # ======================================================================
 # RAG pipeline (uses the pre-built index from data/ via rag_core)
 # ======================================================================
-def generate_answer(prompt: str) -> str:
-    """توليد الإجابة مع استدعاء Groq API بشكل آمن لضمان عدم حدوث NameError."""
-    api_key = CONFIG.get("GROQ_API_KEY") or _get_api_key()
-    if not api_key:
-        return "__LLM_ERROR__: مفتاح Groq API غير متاح في الإعدادات."
-
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "llama-3.1-8b-instant",  # الموديل المستقر والمدعوم حالياً على Groq
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are an expert first-aid medical assistant. Provide clear, accurate, and structured instructions."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 1024
-    }
-
+def answer_question(question, index, embedding_model, reranker):
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+        # كود المعالجة الحالي الخاص بك...
+        corrected_question, was_corrected = correct_user_query(question, use_llm=True)
+        original_question = question
+        question = corrected_question or question
+
+        lang = detect_language(question)
+        retrieval_query = translate_to_english(question) if lang != "en" else question
+        expanded_query = expand_query(retrieval_query)
+
+        candidates = retrieve_top_k_hybrid(
+            expanded_query, index["bm25"], embedding_model, index["embedding_matrix"],
+            index["chunks_df"], k=TOP_K,
+        )
+        reranked = rerank_candidates(expanded_query, candidates, reranker, top_n=TOP_N_RERANK)
+        context = build_context_package(query=expanded_query, reranked_df=reranked)
+
+        correction_info = {"was_corrected": was_corrected, "original": original_question, "corrected": question}
+
+        if context["num_sources"] == 0:
+            return None, None, [], "no_sources", correction_info
+
+        prompt = build_chat_prompt(condition=question, context_text=context["context_text"])
+        raw = generate_answer(prompt)
+
+        if raw and raw.startswith("__LLM_ERROR__"):
+            err_details = raw.replace("__LLM_ERROR__:", "").strip()
+            return err_details, err_details, [], "llm_error", correction_info
+
+        answer_en = raw
+        answer_ar = translate_to_arabic(raw) if raw else None
+
+        sources_payload = []
+        if context["num_sources"] > 0:
+            for _, row in context["selected_df"].iterrows():
+                page = row.get("page_number")
+                score = row.get("rerank_score")
+                page_int = int(page) if pd.notna(page) and page != -1 else None
+                images = index["page_to_images"].get(page_int, []) if page_int is not None else []
+                sources_payload.append({
+                    "chunk_id": row.get("chunk_id", ""),
+                    "section": row.get("section", "N/A"),
+                    "page_number": page_int,
+                    "score": float(score) if pd.notna(score) else None,
+                    "confidence": confidence_label(score) if pd.notna(score) else "—",
+                    "text": row["chunk_text"],
+                    "images": images,
+                })
+
+        return answer_en, answer_ar, sources_payload, None, correction_info
+
     except Exception as e:
-        return f"__LLM_ERROR__: {e}"
+        # إرجاع نص الخطأ الدقيق بدلاً من إيقاف Streamlit
+        err_msg = f"NameError/Exception in answer_question: {e}"
+        return err_msg, err_msg, [], "llm_error", {"was_corrected": False, "original": question, "corrected": question}
 # ======================================================================
 # Main
 # ======================================================================
