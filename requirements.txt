@@ -3,6 +3,7 @@ numpy
 pandas
 scikit-learn
 sentence-transformers
+torchvision
 requests
 langdetect
 deep-translator
