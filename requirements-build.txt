@@ -5,3 +5,4 @@
 docling
 pymupdf
 wordfreq
+torchvision
