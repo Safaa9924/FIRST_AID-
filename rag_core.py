@@ -46,7 +46,7 @@ CONFIG = {
     "MAX_CONTEXT_CHUNKS": 8,
     "WORD_BUDGET": 1500,
     "MAX_CHUNK_WORDS_IN_CONTEXT": 180,
-    "MIN_CHUNK_SCORE": -1000,
+    "MIN_CHUNK_SCORE": -1000,   # ← تم التعديل لضمان عدم استبعاد أي مقطع
 
     # ---------------- LLM ----------------
     # Two backends are supported:
@@ -57,7 +57,7 @@ CONFIG = {
     "GROQ_API_KEY": os.environ.get("GROQ_API_KEY", ""),
     "GROQ_URL": "https://api.groq.com/openai/v1/chat/completions",
     "OLLAMA_URL": os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate"),
-    "LLM_MODEL_NAME": os.environ.get("LLM_MODEL_NAME", "llama3.2"),
+    "LLM_MODEL_NAME": os.environ.get("LLM_MODEL_NAME", "llama3-8b-8192"),  # ← تم التغيير هنا
     "LLM_TEMPERATURE": 0.1,
     "LLM_MAX_TOKENS": 1200,
     "LLM_SEED": 42,
