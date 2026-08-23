@@ -608,12 +608,14 @@ def main():
         with st.chat_message("user", avatar="🧑"):
             st.markdown(question)
 
+        # التحقق من وجود مفتاح API وإظهار سبب دقيق في حالة غيابه
         if not api_key:
+            missing_key_msg = "⚠️ مفتاح Groq API غير معرّف! يرجى إضافته في Streamlit Secrets باسم GROQ_API_KEY."
             with st.chat_message("assistant", avatar="🚑"):
-                st.warning("الخدمة غير متاحة حاليًا، برجاء المحاولة بعد قليل 🙏")
+                st.error(missing_key_msg)
             st.session_state.chat_history.append({
                 "role": "assistant",
-                "content": "الخدمة غير متاحة حاليًا، برجاء المحاولة بعد قليل 🙏",
+                "content": missing_key_msg,
                 "sources": [],
             })
             st.stop()
@@ -624,8 +626,7 @@ def main():
                     question, index, embedding_model, reranker
                 )
 
-            # دليل مرئي بسيط إن طبقة التصحيح فعلاً اشتغلت وغيّرت حاجة —
-            # بيظهر بس لو حصل تغيير فعلي، وبيتفضل مخفي لو السؤال كان سليم أصلًا.
+            # دليل مرئي بسيط إن طبقة التصحيح فعلاً اشتغلت وغيّرت حاجة
             if correction_info and correction_info.get("was_corrected"):
                 st.caption(f"✏️ تم تصحيح السؤال تلقائيًا إلى: *{correction_info['corrected']}*")
 
@@ -634,9 +635,10 @@ def main():
                 st.warning(msg_text)
                 st.session_state.chat_history.append({"role": "assistant", "content": msg_text, "sources": []})
             elif error == "llm_error":
-                msg_text = "الخدمة غير متاحة حاليًا، برجاء المحاولة بعد قليل 🙏"
-                st.warning(msg_text)
-                st.session_state.chat_history.append({"role": "assistant", "content": msg_text, "sources": []})
+                # طباعة تفاصيل الخطأ بدلاً من النص العام لتسهيل التشخيص
+                debug_error_msg = f"⚠️ حدث خطأ أثناء الاتصال بالنموذج (LLM Error): {answer_en}"
+                st.error(debug_error_msg)
+                st.session_state.chat_history.append({"role": "assistant", "content": debug_error_msg, "sources": []})
             else:
                 st.markdown("**🇬🇧 English**")
                 st.markdown(answer_en)
