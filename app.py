@@ -497,177 +497,716 @@ def render_sidebar(chunk_count):
 # ======================================================================
 # RAG pipeline (uses the pre-built index from data/ via rag_core)
 # ======================================================================
+# ======================================================================
+# Answer Question
+# ======================================================================
 def answer_question(question, index, embedding_model, reranker):
-    try:
-        # كود المعالجة الحالي الخاص بك...
-        corrected_question, was_corrected = correct_user_query(question, use_llm=True)
-        original_question = question
-        question = corrected_question or question
 
+    original_question = question
+
+    correction_info = {
+        "was_corrected": False,
+        "original": original_question,
+        "corrected": original_question
+    }
+
+    try:
+
+        # ==============================================================
+        # 1. Query Correction
+        # ==============================================================
+        corrected_question, was_corrected = correct_user_query(
+            question,
+            use_llm=True
+        )
+
+        question = corrected_question or original_question
+
+        correction_info = {
+            "was_corrected": was_corrected,
+            "original": original_question,
+            "corrected": question
+        }
+
+        # ==============================================================
+        # 2. Language Detection
+        # ==============================================================
         lang = detect_language(question)
-        retrieval_query = translate_to_english(question) if lang != "en" else question
+
+        # ==============================================================
+        # 3. Translate Query to English
+        # ==============================================================
+        if lang != "en":
+            retrieval_query = translate_to_english(question)
+        else:
+            retrieval_query = question
+
+        if not retrieval_query:
+            retrieval_query = question
+
+        # ==============================================================
+        # 4. Query Expansion
+        # ==============================================================
         expanded_query = expand_query(retrieval_query)
 
+        if not expanded_query:
+            expanded_query = retrieval_query
+
+        # ==============================================================
+        # 5. Hybrid Retrieval
+        # ==============================================================
         candidates = retrieve_top_k_hybrid(
-            expanded_query, index["bm25"], embedding_model, index["embedding_matrix"],
-            index["chunks_df"], k=TOP_K,
+            expanded_query,
+            index["bm25"],
+            embedding_model,
+            index["embedding_matrix"],
+            index["chunks_df"],
+            k=TOP_K,
         )
-        reranked = rerank_candidates(expanded_query, candidates, reranker, top_n=TOP_N_RERANK)
-        context = build_context_package(query=expanded_query, reranked_df=reranked)
 
-        correction_info = {"was_corrected": was_corrected, "original": original_question, "corrected": question}
+        if candidates is None or len(candidates) == 0:
 
-        if context["num_sources"] == 0:
-            return None, None, [], "no_sources", correction_info
+            return (
+                None,
+                None,
+                [],
+                "no_sources",
+                correction_info
+            )
 
-        prompt = build_chat_prompt(condition=question, context_text=context["context_text"])
+        # ==============================================================
+        # 6. Reranking
+        # ==============================================================
+        reranked = rerank_candidates(
+            expanded_query,
+            candidates,
+            reranker,
+            top_n=TOP_N_RERANK
+        )
+
+        if reranked is None or len(reranked) == 0:
+
+            return (
+                None,
+                None,
+                [],
+                "no_sources",
+                correction_info
+            )
+
+        # ==============================================================
+        # 7. Build Context
+        # ==============================================================
+        context = build_context_package(
+            query=expanded_query,
+            reranked_df=reranked
+        )
+
+        if not context:
+            return (
+                None,
+                None,
+                [],
+                "no_sources",
+                correction_info
+            )
+
+        if context.get("num_sources", 0) == 0:
+
+            return (
+                None,
+                None,
+                [],
+                "no_sources",
+                correction_info
+            )
+
+        # ==============================================================
+        # 8. Build LLM Prompt
+        # ==============================================================
+        prompt = build_chat_prompt(
+            condition=question,
+            context_text=context.get("context_text", "")
+        )
+
+        if not prompt:
+            return (
+                None,
+                None,
+                [],
+                "llm_error",
+                correction_info
+            )
+
+        # ==============================================================
+        # 9. Generate English Answer
+        # ==============================================================
         raw = generate_answer(prompt)
 
-        if raw and raw.startswith("__LLM_ERROR__"):
-            err_details = raw.replace("__LLM_ERROR__:", "").strip()
-            return err_details, err_details, [], "llm_error", correction_info
+        if not raw:
+
+            return (
+                "LLM returned an empty response.",
+                "LLM returned an empty response.",
+                [],
+                "llm_error",
+                correction_info
+            )
+
+        # ==============================================================
+        # 10. Handle LLM Errors
+        # ==============================================================
+        if isinstance(raw, str) and raw.startswith("__LLM_ERROR__"):
+
+            err_details = raw.replace(
+                "__LLM_ERROR__:",
+                ""
+            ).strip()
+
+            return (
+                err_details,
+                err_details,
+                [],
+                "llm_error",
+                correction_info
+            )
 
         answer_en = raw
-        answer_ar = translate_to_arabic(raw) if raw else None
 
+        # ==============================================================
+        # 11. Translate Answer to Arabic
+        # ==============================================================
+        try:
+
+            answer_ar = translate_to_arabic(answer_en)
+
+        except Exception as translation_error:
+
+            answer_ar = (
+                "تعذر ترجمة الإجابة للعربية.\n\n"
+                f"Translation error: {type(translation_error).__name__}: "
+                f"{translation_error}"
+            )
+
+        # ==============================================================
+        # 12. Prepare Sources
+        # ==============================================================
         sources_payload = []
-        if context["num_sources"] > 0:
-            for _, row in context["selected_df"].iterrows():
+
+        selected_df = context.get("selected_df")
+
+        if selected_df is not None and len(selected_df) > 0:
+
+            for _, row in selected_df.iterrows():
+
                 page = row.get("page_number")
                 score = row.get("rerank_score")
-                page_int = int(page) if pd.notna(page) and page != -1 else None
-                images = index["page_to_images"].get(page_int, []) if page_int is not None else []
+
+                # ------------------------------------------------------
+                # Page Number
+                # ------------------------------------------------------
+                try:
+
+                    page_int = (
+                        int(page)
+                        if pd.notna(page) and page != -1
+                        else None
+                    )
+
+                except Exception:
+
+                    page_int = None
+
+                # ------------------------------------------------------
+                # Images
+                # ------------------------------------------------------
+                if page_int is not None:
+
+                    images = index.get(
+                        "page_to_images",
+                        {}
+                    ).get(
+                        page_int,
+                        []
+                    )
+
+                else:
+
+                    images = []
+
+                # ------------------------------------------------------
+                # Score
+                # ------------------------------------------------------
+                try:
+
+                    score_float = (
+                        float(score)
+                        if pd.notna(score)
+                        else None
+                    )
+
+                except Exception:
+
+                    score_float = None
+
+                # ------------------------------------------------------
+                # Confidence
+                # ------------------------------------------------------
+                try:
+
+                    confidence = (
+                        confidence_label(score)
+                        if pd.notna(score)
+                        else "—"
+                    )
+
+                except Exception:
+
+                    confidence = "—"
+
+                # ------------------------------------------------------
+                # Source Payload
+                # ------------------------------------------------------
                 sources_payload.append({
-                    "chunk_id": row.get("chunk_id", ""),
-                    "section": row.get("section", "N/A"),
+
+                    "chunk_id": row.get(
+                        "chunk_id",
+                        ""
+                    ),
+
+                    "section": row.get(
+                        "section",
+                        "N/A"
+                    ),
+
                     "page_number": page_int,
-                    "score": float(score) if pd.notna(score) else None,
-                    "confidence": confidence_label(score) if pd.notna(score) else "—",
-                    "text": row["chunk_text"],
+
+                    "score": score_float,
+
+                    "confidence": confidence,
+
+                    "text": row.get(
+                        "chunk_text",
+                        ""
+                    ),
+
                     "images": images,
                 })
 
-        return answer_en, answer_ar, sources_payload, None, correction_info
+        # ==============================================================
+        # 13. SUCCESS
+        # ==============================================================
+        return (
+            answer_en,
+            answer_ar,
+            sources_payload,
+            None,
+            correction_info
+        )
 
+    # ==================================================================
+    # ERROR HANDLING
+    # ==================================================================
     except Exception as e:
-        # إرجاع نص الخطأ الدقيق بدلاً من إيقاف Streamlit
-        err_msg = f"NameError/Exception in answer_question: {e}"
-        return err_msg, err_msg, [], "llm_error", {"was_corrected": False, "original": question, "corrected": question}
+
+        import traceback
+
+        print("=" * 80)
+        print("ERROR INSIDE answer_question")
+        print("ERROR TYPE:", type(e).__name__)
+        print("ERROR:", str(e))
+        print("TRACEBACK:")
+        print(traceback.format_exc())
+        print("=" * 80)
+
+        err_msg = (
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+        return (
+            err_msg,
+            err_msg,
+            [],
+            "llm_error",
+            correction_info
+        )
+
+
 # ======================================================================
 # Main
 # ======================================================================
 def main():
+
     render_hero()
 
+    # ==================================================================
+    # Load Index
+    # ==================================================================
     index = load_index()
+
     if index is None:
+
         with st.sidebar:
             pass
+
         st.error(
             "الخدمة غير متاحة حاليًا، برجاء المحاولة لاحقًا 🙏\n\n"
-            "(لمطوّر الموقع: لم يتم العثور على مجلد `data/` — شغّل `build_index.py` "
-            "أولًا وارفع نتائجه. راجع SETUP.md)."
+            "(لمطوّر الموقع: لم يتم العثور على مجلد `data/` — "
+            "شغّل `build_index.py` أولًا وارفع نتائجه. "
+            "راجع SETUP.md)."
         )
+
         st.stop()
 
-    show_sources = render_sidebar(len(index["chunks_df"]))
+    # ==================================================================
+    # Sidebar
+    # ==================================================================
+    show_sources = render_sidebar(
+        len(index["chunks_df"])
+    )
 
+    # ==================================================================
+    # API Key
+    # ==================================================================
     api_key = _get_api_key()
+
     if api_key:
+
         CONFIG["GROQ_API_KEY"] = api_key
 
+    # ==================================================================
+    # Chat History
+    # ==================================================================
     if "chat_history" not in st.session_state:
+
         st.session_state.chat_history = []
 
-    with st.spinner("جارِ تجهيز قاعدة المعرفة..."):
+    # ==================================================================
+    # Load Models
+    # ==================================================================
+    with st.spinner(
+        "جارِ تجهيز قاعدة المعرفة..."
+    ):
+
         embedding_model, reranker = load_models()
 
+    # ==================================================================
+    # Topics
+    # ==================================================================
     clicked_topic = render_topics()
+
     st.markdown("---")
-    st.markdown('<div class="section-label">💬 اسأل المساعد</div>', unsafe_allow_html=True)
-
-    # عرض المحادثة السابقة على هيئة شات
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"], avatar="🚑" if msg["role"] == "assistant" else "🧑"):
-            if msg["role"] == "assistant":
-                if "content_en" in msg and msg["content_en"]:
-                    st.markdown("**🇬🇧 English**")
-                    st.markdown(msg["content_en"])
-                    st.markdown("---")
-                    st.markdown("**🇪🇬 بالعربي**")
-                    st.markdown(msg["content_ar"])
-                else:
-                    st.markdown(msg.get("content", ""))
-            else:
-                st.markdown(msg["content"])
-            if msg.get("sources") and show_sources:
-                st.markdown("**📚 المصادر**")
-                render_sources(msg["sources"])
-
-    question = st.chat_input("اكتب سؤالك عن الإسعافات الأولية هنا...")
-    if clicked_topic and not question:
-        question = clicked_topic
-
-    if question:
-        st.session_state.chat_history.append({"role": "user", "content": question})
-        with st.chat_message("user", avatar="🧑"):
-            st.markdown(question)
-
-        # التحقق من وجود مفتاح API وإظهار سبب دقيق في حالة غيابه
-        if not api_key:
-            missing_key_msg = "⚠️ مفتاح Groq API غير معرّف! يرجى إضافته في Streamlit Secrets باسم GROQ_API_KEY."
-            with st.chat_message("assistant", avatar="🚑"):
-                st.error(missing_key_msg)
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": missing_key_msg,
-                "sources": [],
-            })
-            st.stop()
-
-        with st.chat_message("assistant", avatar="🚑"):
-            with st.spinner("جارِ البحث عن أفضل إجابة..."):
-                answer_en, answer_ar, sources_payload, error, correction_info = answer_question(
-                    question, index, embedding_model, reranker
-                )
-
-            # دليل مرئي بسيط إن طبقة التصحيح فعلاً اشتغلت وغيّرت حاجة
-            if correction_info and correction_info.get("was_corrected"):
-                st.caption(f"✏️ تم تصحيح السؤال تلقائيًا إلى: *{correction_info['corrected']}*")
-
-            if error == "no_sources":
-                msg_text = "معنديش معلومة موثوقة عن السؤال ده في المرجع، حاول تصيغه بشكل مختلف 🙏"
-                st.warning(msg_text)
-                st.session_state.chat_history.append({"role": "assistant", "content": msg_text, "sources": []})
-            elif error == "llm_error":
-                # طباعة تفاصيل الخطأ بدلاً من النص العام لتسهيل التشخيص
-                debug_error_msg = f"⚠️ حدث خطأ أثناء الاتصال بالنموذج (LLM Error): {answer_en}"
-                st.error(debug_error_msg)
-                st.session_state.chat_history.append({"role": "assistant", "content": debug_error_msg, "sources": []})
-            else:
-                st.markdown("**🇬🇧 English**")
-                st.markdown(answer_en)
-                st.markdown("---")
-                st.markdown("**🇪🇬 بالعربي**")
-                st.markdown(answer_ar)
-
-                if sources_payload and show_sources:
-                    st.markdown("**📚 المصادر**")
-                    render_sources(sources_payload)
-
-                st.session_state.chat_history.append({
-                    "role": "assistant",
-                    "content_en": answer_en,
-                    "content_ar": answer_ar,
-                    "sources": sources_payload,
-                })
 
     st.markdown(
-        "<div class='disclaimer' style='margin-top:1.6rem;'>⚠️ هذا الموقع للأغراض التعليمية "
-        "فقط ولا يغني عن استشارة طبية أو الاتصال بالطوارئ عند الحاجة.</div>",
-        unsafe_allow_html=True,
+        '<div class="section-label">💬 اسأل المساعد</div>',
+        unsafe_allow_html=True
+    )
+
+    # ==================================================================
+    # Display Previous Chat
+    # ==================================================================
+    for msg in st.session_state.chat_history:
+
+        with st.chat_message(
+            msg["role"],
+            avatar=(
+                "🚑"
+                if msg["role"] == "assistant"
+                else "🧑"
+            )
+        ):
+
+            if msg["role"] == "assistant":
+
+                if (
+                    "content_en" in msg
+                    and msg["content_en"]
+                ):
+
+                    st.markdown(
+                        "**🇬🇧 English**"
+                    )
+
+                    st.markdown(
+                        msg["content_en"]
+                    )
+
+                    st.markdown("---")
+
+                    st.markdown(
+                        "**🇪🇬 بالعربي**"
+                    )
+
+                    st.markdown(
+                        msg.get(
+                            "content_ar",
+                            ""
+                        )
+                    )
+
+                else:
+
+                    st.markdown(
+                        msg.get(
+                            "content",
+                            ""
+                        )
+                    )
+
+            else:
+
+                st.markdown(
+                    msg["content"]
+                )
+
+            # ----------------------------------------------------------
+            # Sources
+            # ----------------------------------------------------------
+            if (
+                msg.get("sources")
+                and show_sources
+            ):
+
+                st.markdown(
+                    "**📚 المصادر**"
+                )
+
+                render_sources(
+                    msg["sources"]
+                )
+
+    # ==================================================================
+    # User Input
+    # ==================================================================
+    question = st.chat_input(
+        "اكتب سؤالك عن الإسعافات الأولية هنا..."
+    )
+
+    if clicked_topic and not question:
+
+        question = clicked_topic
+
+    # ==================================================================
+    # Process Question
+    # ==================================================================
+    if question:
+
+        # --------------------------------------------------------------
+        # Add User Message
+        # --------------------------------------------------------------
+        st.session_state.chat_history.append({
+
+            "role": "user",
+
+            "content": question
+
+        })
+
+        with st.chat_message(
+            "user",
+            avatar="🧑"
+        ):
+
+            st.markdown(question)
+
+        # --------------------------------------------------------------
+        # Check API Key
+        # --------------------------------------------------------------
+        if not api_key:
+
+            missing_key_msg = (
+                "⚠️ مفتاح Groq API غير معرّف!\n\n"
+                "يرجى إضافته في Streamlit Secrets "
+                "باسم `GROQ_API_KEY`."
+            )
+
+            with st.chat_message(
+                "assistant",
+                avatar="🚑"
+            ):
+
+                st.error(
+                    missing_key_msg
+                )
+
+            st.session_state.chat_history.append({
+
+                "role": "assistant",
+
+                "content": missing_key_msg,
+
+                "sources": []
+
+            })
+
+            st.stop()
+
+        # --------------------------------------------------------------
+        # Assistant
+        # --------------------------------------------------------------
+        with st.chat_message(
+            "assistant",
+            avatar="🚑"
+        ):
+
+            with st.spinner(
+                "جارِ البحث عن أفضل إجابة..."
+            ):
+
+                (
+                    answer_en,
+                    answer_ar,
+                    sources_payload,
+                    error,
+                    correction_info
+                ) = answer_question(
+
+                    question,
+
+                    index,
+
+                    embedding_model,
+
+                    reranker
+
+                )
+
+            # ----------------------------------------------------------
+            # Show Query Correction
+            # ----------------------------------------------------------
+            if (
+                correction_info
+                and correction_info.get(
+                    "was_corrected"
+                )
+            ):
+
+                st.caption(
+                    "✏️ تم تصحيح السؤال تلقائيًا إلى: "
+                    f"*{correction_info['corrected']}*"
+                )
+
+            # ==========================================================
+            # No Sources
+            # ==========================================================
+            if error == "no_sources":
+
+                msg_text = (
+                    "معنديش معلومة موثوقة عن السؤال ده "
+                    "في المرجع، حاول تصيغه بشكل مختلف 🙏"
+                )
+
+                st.warning(
+                    msg_text
+                )
+
+                st.session_state.chat_history.append({
+
+                    "role": "assistant",
+
+                    "content": msg_text,
+
+                    "sources": []
+
+                })
+
+            # ==========================================================
+            # LLM Error
+            # ==========================================================
+            elif error == "llm_error":
+
+                debug_error_msg = (
+                    "⚠️ حدث خطأ أثناء الاتصال بالنموذج "
+                    f"(LLM Error): {answer_en}"
+                )
+
+                st.error(
+                    debug_error_msg
+                )
+
+                st.session_state.chat_history.append({
+
+                    "role": "assistant",
+
+                    "content": debug_error_msg,
+
+                    "sources": []
+
+                })
+
+            # ==========================================================
+            # Success
+            # ==========================================================
+            else:
+
+                st.markdown(
+                    "**🇬🇧 English**"
+                )
+
+                st.markdown(
+                    answer_en
+                )
+
+                st.markdown("---")
+
+                st.markdown(
+                    "**🇪🇬 بالعربي**"
+                )
+
+                st.markdown(
+                    answer_ar
+                )
+
+                # ------------------------------------------------------
+                # Sources
+                # ------------------------------------------------------
+                if (
+                    sources_payload
+                    and show_sources
+                ):
+
+                    st.markdown(
+                        "**📚 المصادر**"
+                    )
+
+                    render_sources(
+                        sources_payload
+                    )
+
+                # ------------------------------------------------------
+                # Save Assistant Message
+                # ------------------------------------------------------
+                st.session_state.chat_history.append({
+
+                    "role": "assistant",
+
+                    "content_en": answer_en,
+
+                    "content_ar": answer_ar,
+
+                    "sources": sources_payload,
+
+                })
+
+    # ==================================================================
+    # Disclaimer
+    # ==================================================================
+    st.markdown(
+
+        "<div class='disclaimer' "
+        "style='margin-top:1.6rem;'>"
+        "⚠️ هذا الموقع للأغراض التعليمية فقط "
+        "ولا يغني عن استشارة طبية أو الاتصال بالطوارئ عند الحاجة."
+        "</div>",
+
+        unsafe_allow_html=True
+
     )
 
 
+# ======================================================================
+# Run App
+# ======================================================================
 if __name__ == "__main__":
+
     main()
