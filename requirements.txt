@@ -6,3 +6,4 @@ sentence-transformers
 requests
 langdetect
 deep-translator
+torchvision
