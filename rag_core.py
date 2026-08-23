@@ -15,7 +15,6 @@ import os
 import re
 import time
 from collections import Counter
-from difflib import SequenceMatcher
 
 import numpy as np
 import pandas as pd
@@ -46,7 +45,7 @@ CONFIG = {
     "MAX_CONTEXT_CHUNKS": 8,
     "WORD_BUDGET": 1500,
     "MAX_CHUNK_WORDS_IN_CONTEXT": 180,
-    "MIN_CHUNK_SCORE": -1000,   # ← تم التعديل لضمان عدم استبعاد أي مقطع
+    "MIN_CHUNK_SCORE": 1.0,
 
     # ---------------- LLM ----------------
     # Two backends are supported:
@@ -57,7 +56,9 @@ CONFIG = {
     "GROQ_API_KEY": os.environ.get("GROQ_API_KEY", ""),
     "GROQ_URL": "https://api.groq.com/openai/v1/chat/completions",
     "OLLAMA_URL": os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate"),
-    "LLM_MODEL_NAME": os.environ.get("LLM_MODEL_NAME", "llama3-8b-8192"),  # ← تم التغيير هنا
+    # llama3-8b-8192 / llama3-70b-8192 تم سحبهم (decommissioned) من Groq.
+    # البديل الرسمي المجاني وسريع الاستجابة: llama-3.1-8b-instant
+    "LLM_MODEL_NAME": os.environ.get("LLM_MODEL_NAME", "llama-3.1-8b-instant"),
     "LLM_TEMPERATURE": 0.1,
     "LLM_MAX_TOKENS": 1200,
     "LLM_SEED": 42,
@@ -204,15 +205,28 @@ def _call_llm(prompt, temperature=None, max_tokens=None, seed=None):
                 timeout=60,
             )
             if not response.ok:
-                # لوجز داخلية للمطور بس — الزائر مش بيشوفها خالص. تظهر
-                # في "Manage app" -> "Logs" على Streamlit Cloud.
-                print(f"[Nabda] Groq API error {response.status_code}: {response.text[:500]}")
-            response.raise_for_status()
+                # response.raise_for_status() only exposes the HTTP status
+                # code, not Groq's actual JSON error body (model_decommissioned,
+                # invalid_api_key, rate_limit_exceeded, etc). Capture the body
+                # explicitly and print it so it lands in Streamlit Cloud logs.
+                try:
+                    detail = response.json()
+                except Exception:
+                    detail = response.text
+                print(f"[GROQ ERROR] status={response.status_code} body={detail}", flush=True)
+                return f"__LLM_ERROR__:Groq HTTP {response.status_code}: {detail}"
+
             data = response.json()
             return data["choices"][0]["message"]["content"].strip()
+        except requests.exceptions.Timeout as e:
+            print(f"[GROQ ERROR] timeout: {e}", flush=True)
+            return f"__LLM_ERROR__:timeout: {e}"
+        except requests.exceptions.ConnectionError as e:
+            print(f"[GROQ ERROR] connection error: {e}", flush=True)
+            return f"__LLM_ERROR__:connection error: {e}"
         except Exception as e:
-            print(f"[Nabda] Groq call failed: {e}")
-            return f"__LLM_ERROR__:{e}"
+            print(f"[GROQ ERROR] unexpected: {type(e).__name__}: {e}", flush=True)
+            return f"__LLM_ERROR__:{type(e).__name__}: {e}"
 
     # Fallback: local Ollama server
     try:
@@ -239,98 +253,24 @@ def _call_llm(prompt, temperature=None, max_tokens=None, seed=None):
 # ============================================================
 # Query correction / language handling
 # ============================================================
-
-# قاموس بمصطلحات الإسعافات الأولية الشائعة بالعربي. بيستخدم في طبقة
-# تصحيح حتمية (deterministic) بتتفعل للأسئلة القصيرة (كلمة أو اتنين)،
-# وبتصحح بس لو التشابه قوي جدًا مع مصطلح معروف — عشان تمسك أخطاء زي
-# "اغماق" -> "إغماء" من غير ما تخمّن كلمات مختلفة تمامًا زي "أعماق".
-ARABIC_FIRST_AID_GLOSSARY = [
-    "نزيف", "نزيف حاد", "نزيف الأنف", "كسر", "كسر مفتوح", "حروق", "حرق كهربائي",
-    "حروق كيميائية", "اختناق", "انسداد مجرى التنفس", "إغماء", "فقدان الوعي",
-    "الإنعاش القلبي الرئوي", "دوخة", "لسعة حشرة", "حساسية", "صدمة تحسسية",
-    "صدمة كهربائية", "غرق", "تسمم", "جرعة زائدة", "سكتة دماغية", "ذبحة صدرية",
-    "نوبة قلبية", "صرع", "تشنجات", "ضربة شمس", "انخفاض حرارة الجسم", "قضمة الصقيع",
-    "جرح عميق", "التواء", "خلع مفصل", "إصابة الرأس", "إصابة العمود الفقري",
-    "اختناق بجسم غريب", "غيبوبة سكر", "هبوط سكر الدم", "لدغة ثعبان",
-]
-
-_GLOSSARY_MATCH_THRESHOLD = 0.55
-
-
-def _closest_glossary_term(text):
-    best_term, best_ratio = None, 0.0
-    for term in ARABIC_FIRST_AID_GLOSSARY:
-        ratio = SequenceMatcher(None, text, term).ratio()
-        if ratio > best_ratio:
-            best_ratio, best_term = ratio, term
-    return best_term, best_ratio
-
-
 def correct_user_query(query, use_llm=True):
-    stripped = query.strip()
-
-    # طبقة 1 — تصحيح حتمي (مش LLM) لمصطلحات شائعة: بتتفعل بس للأسئلة
-    # القصيرة جدًا (كلمة أو اتنين)، وبتصحح بس لو في تطابق قوي جدًا مع
-    # مصطلح معروف. سريعة، ثابتة، ومش محتاجة اتصال إنترنت.
-    if stripped and len(stripped.split()) <= 3:
-        glossary_term, ratio = _closest_glossary_term(stripped)
-        if glossary_term and ratio >= _GLOSSARY_MATCH_THRESHOLD and glossary_term != stripped:
-            return glossary_term, True
-
     if not use_llm:
         return query, False
 
     prompt = (
-        "You are a strict spelling and grammar checker. You are NOT a first-aid "
-        "expert and you must NOT try to guess what the user 'probably meant'.\n\n"
-        "TASK: fix ONLY obvious spelling/typing mistakes in the text below.\n\n"
-        "STRICT RULES:\n"
-        "1. Do NOT change the meaning or topic in any way.\n"
-        "2. Do NOT invent a new question, and do NOT guess the user's intent.\n"
-        "3. Do NOT answer the question or add any information to it.\n"
-        "4. Keep the exact same language as the input (if it's Arabic, the output "
-        "must be Arabic; if English, output must be English).\n"
-        "5. If the text is unclear, nonsensical, a single ambiguous word, unrelated "
-        "to first aid, or you are not fully certain what to fix, return it EXACTLY "
-        "as given, character for character, with nothing changed.\n"
-        "6. Return ONLY the resulting text, nothing else — no explanation, no "
-        "quotation marks, no preamble.\n\n"
-        f"Text: {query}"
+        "Fix only spelling and grammar mistakes in the following first-aid "
+        "question. Do NOT change its meaning, do NOT answer it, do NOT add "
+        "information. If it is already correct, return it unchanged. "
+        "Return ONLY the corrected question, nothing else.\n\n"
+        f"Question: {query}"
     )
     corrected = _call_llm(prompt, temperature=0.0, max_tokens=100)
     if corrected.startswith("__LLM_ERROR__"):
         return query, False
-
-    corrected = corrected.strip().strip('"').strip()
-    if not corrected or corrected.lower() == query.lower():
-        return query, False
-
-    # حماية 1 — حارس اللغة: ارفض أي "تصحيح" غيّر أبجدية النص بالكامل
-    # (يعني النموذج ترجم السؤال بدل ما يصحح إملاءه). نتحقق بعدّ نسبة
-    # الحروف العربية في كل نص بدل الاعتماد على langdetect (بيبقى غير
-    # موثوق مع الجمل القصيرة أو الكلمة الواحدة).
-    def _arabic_ratio(text):
-        letters = [c for c in text if c.isalpha()]
-        if not letters:
-            return 0.0
-        arabic = sum(1 for c in letters if "\u0600" <= c <= "\u06FF")
-        return arabic / len(letters)
-
-    orig_ratio = _arabic_ratio(query)
-    corr_ratio = _arabic_ratio(corrected)
-    # لو الأصل عربي بوضوح والناتج مبقاش عربي بوضوح (أو العكس) — ده مش
-    # تصحيح إملائي، ده تغيير لغة كامل. ارفضه.
-    if (orig_ratio > 0.5) != (corr_ratio > 0.5):
-        return query, False
-
-    # حماية 2 — لو الناتج مختلف جدًا عن السؤال الأصلي (يعني النموذج
-    # اخترع سؤال تاني بدل ما يصحح إملاء فعليًا)، نرفض "التصحيح" ونرجّع
-    # السؤال الأصلي زي ما هو بدل ما نغيّر قصد المستخدم.
-    similarity = SequenceMatcher(None, query.lower(), corrected.lower()).ratio()
-    if similarity < 0.45:
-        return query, False
-
-    return corrected, True
+    corrected = corrected.strip().strip('"')
+    if corrected and corrected.lower() != query.lower():
+        return corrected, True
+    return query, False
 
 
 def detect_language(text):
@@ -448,14 +388,6 @@ def build_context_package(query, reranked_df, max_context_chunks=None, word_budg
 
     candidates = reranked_df[reranked_df["rerank_score"] >= min_chunk_score].copy()
     rejected_count = len(reranked_df) - len(candidates)
-
-    # لوج تشخيصي للمطور بس (Manage app -> Logs) — بيوريك أعلى درجات
-    # فعلية رجعها الـ reranker قبل الفلترة، عشان نتأكد العتبة (threshold)
-    # متظبطة صح مع النطاق الحقيقي للدرجات.
-    if not reranked_df.empty:
-        top_scores = reranked_df["rerank_score"].head(5).round(3).tolist()
-        print(f"[Nabda] query='{query[:60]}' top rerank scores={top_scores} "
-              f"threshold={min_chunk_score} kept={len(candidates)}/{len(reranked_df)}")
 
     if candidates.empty:
         return {
