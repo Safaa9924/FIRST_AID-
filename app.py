@@ -507,8 +507,17 @@ def answer_question(question, index, embedding_model, reranker):
     answer_en = raw
     answer_ar = translate_to_arabic(raw) if raw else None
 
+    # الموديل ممكن "يرد" برسالة رفض ثابتة ("I couldn't find this
+    # information...") بدل إجابة حقيقية، لما الـ context اللي وصله ضعيف
+    # أو مش مرتبط. في الحالة دي المصادر اللي اترفقت معاه فعليًا مالهاش
+    # علاقة بالسؤال (وصلت بس لأن MIN_CHUNK_SCORE بيقبل كل حاجة)، فمينفعش
+    # نعرضها للمستخدم على إنها "مصادر" — ده مضلل. امسحها في الحالة دي.
+    is_refusal = bool(answer_en) and answer_en.strip().lower().startswith(
+        "i couldn't find this information"
+    )
+
     sources_payload = []
-    if context["num_sources"] > 0:
+    if not is_refusal and context["num_sources"] > 0:
         for _, row in context["selected_df"].iterrows():
             page = row.get("page_number")
             score = row.get("rerank_score")
@@ -520,6 +529,10 @@ def answer_question(question, index, embedding_model, reranker):
                 "confidence": confidence_label(score) if pd.notna(score) else "—",
                 "text": row["chunk_text"],
             })
+
+    if is_refusal:
+        print(f"[APP] model declined to answer (weak/irrelevant context) query={question!r}", flush=True)
+        return None, None, [], "no_sources"
 
     return answer_en, answer_ar, sources_payload, None
 
