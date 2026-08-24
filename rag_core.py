@@ -52,6 +52,13 @@ CONFIG = {
     # سالب كبير) عشان محدش يترفض، أو اضبطها بعد ما تشوف نطاق الدرجات
     # الفعلي في اللوج (top rerank scores=[...]).
     "MIN_CHUNK_SCORE": -1000,
+    # عتبتين مستقلتين بس لعرض "الثقة" للمستخدم (High/Medium/Low)، مالهومش
+    # علاقة بقبول أو رفض المصدر من الـ context. اضبطهم بعد ما تشوف نطاق
+    # الدرجات الحقيقي في اللوجز (سطر [RETRIEVAL] top_scores=...):
+    # قارن score لمصدر تعرف إنه صح 100% مع score لمصدر تعرف إنه غلط،
+    # وحط الرقمين بينهم. القيم دي مبدئية وتقريبية فقط.
+    "CONFIDENCE_HIGH_THRESHOLD": -4.0,
+    "CONFIDENCE_MEDIUM_THRESHOLD": -7.0,
 
     # ---------------- LLM ----------------
     # Two backends are supported:
@@ -108,11 +115,16 @@ def min_max_normalize(scores):
     return (scores - lo) / (hi - lo)
 
 
-def confidence_label(score, min_score=None):
-    min_score = CONFIG["MIN_CHUNK_SCORE"] if min_score is None else min_score
-    if score < min_score:
-        return "Rejected"
-    elif score < min_score * 1.8:
+def confidence_label(score, high_threshold=None, medium_threshold=None):
+    # ملحوظة: دول مستقلين تمامًا عن MIN_CHUNK_SCORE (اللي بيتحكم في
+    # قبول/رفض المصدر من الأساس). لو ربطناهم ببعض زي الأول، أي تغيير
+    # في MIN_CHUNK_SCORE (زي جعله -1000 عشان مايرفضش حاجة) كان بيكسر
+    # التصنيف ويخلي كل حاجة "High" حتى لو مش قريبة من السؤال أصلاً.
+    high_threshold = CONFIG["CONFIDENCE_HIGH_THRESHOLD"] if high_threshold is None else high_threshold
+    medium_threshold = CONFIG["CONFIDENCE_MEDIUM_THRESHOLD"] if medium_threshold is None else medium_threshold
+    if score < medium_threshold:
+        return "Low"
+    elif score < high_threshold:
         return "Medium"
     else:
         return "High"
