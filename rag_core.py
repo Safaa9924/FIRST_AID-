@@ -56,9 +56,19 @@ CONFIG = {
     "GROQ_API_KEY": os.environ.get("GROQ_API_KEY", ""),
     "GROQ_URL": "https://api.groq.com/openai/v1/chat/completions",
     "OLLAMA_URL": os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate"),
-    # llama3-8b-8192 / llama3-70b-8192 تم سحبهم (decommissioned) من Groq.
-    # البديل الرسمي المجاني وسريع الاستجابة: llama-3.1-8b-instant
-    "LLM_MODEL_NAME": os.environ.get("LLM_MODEL_NAME", "llama-3.1-8b-instant"),
+    # آخر تحديث معروف (أغسطس 2026): llama-3.1-8b-instant و
+    # llama-3.3-70b-versatile اتقفلوا في 17 يونيو 2026. البديل الرسمي:
+    # openai/gpt-oss-20b (خفيف) / openai/gpt-oss-120b (أقوى).
+    # لو اتقفل تاني، شوف console.groq.com/docs/deprecations وحدّث هنا،
+    # أو خلي المتغير البيئي LLM_MODEL_NAME يتغير من غير تعديل كود.
+    "LLM_MODEL_NAME": os.environ.get("LLM_MODEL_NAME", "openai/gpt-oss-20b"),
+    # لو الموديل الأساسي اتقفل فجأة، جرب البدائل دي بالترتيب قبل ما تفشل
+    # السؤال بالكامل. أضِف/عدّل القائمة من غير ما تلمس الكود التاني.
+    "LLM_MODEL_FALLBACKS": [
+        m.strip() for m in os.environ.get(
+            "LLM_MODEL_FALLBACKS", "openai/gpt-oss-120b,qwen/qwen3.6-27b"
+        ).split(",") if m.strip()
+    ],
     "LLM_TEMPERATURE": 0.1,
     "LLM_MAX_TOKENS": 1200,
     "LLM_SEED": 42,
@@ -180,53 +190,86 @@ def expand_query(query):
 # Returns the raw text on success, or a string starting with
 # "__LLM_ERROR__:" on failure (never raises).
 # ============================================================
+def _call_groq_once(model_name, prompt, temperature, max_tokens, seed):
+    """Single Groq call for one model. Returns (text, error_detail).
+    error_detail is None on success; otherwise a dict/str describing why,
+    plus whether it's a 'model unavailable' style error worth retrying
+    with a fallback model."""
+    try:
+        response = requests.post(
+            CONFIG["GROQ_URL"],
+            headers={
+                "Authorization": f"Bearer {CONFIG['GROQ_API_KEY']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "seed": seed,
+            },
+            timeout=60,
+        )
+        if not response.ok:
+            # response.raise_for_status() only exposes the HTTP status
+            # code, not Groq's actual JSON error body (model_decommissioned,
+            # invalid_api_key, rate_limit_exceeded, etc). Capture the body
+            # explicitly and print it so it lands in Streamlit Cloud logs.
+            try:
+                detail = response.json()
+            except Exception:
+                detail = response.text
+            print(f"[GROQ ERROR] model={model_name} status={response.status_code} body={detail}", flush=True)
+            code = ""
+            if isinstance(detail, dict):
+                code = detail.get("error", {}).get("code", "")
+            # These status/code combos mean "this model name is dead",
+            # not "Groq is down" — worth retrying with a fallback model.
+            model_dead = response.status_code in (400, 404) and code in (
+                "model_decommissioned", "model_not_found",
+            )
+            return None, {"status": response.status_code, "detail": detail, "model_dead": model_dead}
+
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip(), None
+    except requests.exceptions.Timeout as e:
+        print(f"[GROQ ERROR] model={model_name} timeout: {e}", flush=True)
+        return None, {"status": None, "detail": f"timeout: {e}", "model_dead": False}
+    except requests.exceptions.ConnectionError as e:
+        print(f"[GROQ ERROR] model={model_name} connection error: {e}", flush=True)
+        return None, {"status": None, "detail": f"connection error: {e}", "model_dead": False}
+    except Exception as e:
+        print(f"[GROQ ERROR] model={model_name} unexpected: {type(e).__name__}: {e}", flush=True)
+        return None, {"status": None, "detail": f"{type(e).__name__}: {e}", "model_dead": False}
+
+
+# ============================================================
+# Unified LLM caller — talks to Groq if GROQ_API_KEY is set,
+# otherwise falls back to a local Ollama server.
+# Returns the raw text on success, or a string starting with
+# "__LLM_ERROR__:" on failure (never raises).
+# ============================================================
 def _call_llm(prompt, temperature=None, max_tokens=None, seed=None):
     temperature = CONFIG["LLM_TEMPERATURE"] if temperature is None else temperature
     max_tokens = max_tokens or CONFIG["LLM_MAX_TOKENS"]
     seed = CONFIG["LLM_SEED"] if seed is None else seed
 
     if CONFIG["GROQ_API_KEY"]:
-        # Groq's API is OpenAI-compatible: /chat/completions with a
-        # "messages" list, not Ollama's "/api/generate" format.
-        try:
-            response = requests.post(
-                CONFIG["GROQ_URL"],
-                headers={
-                    "Authorization": f"Bearer {CONFIG['GROQ_API_KEY']}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": CONFIG["LLM_MODEL_NAME"],
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "seed": seed,
-                },
-                timeout=60,
-            )
-            if not response.ok:
-                # response.raise_for_status() only exposes the HTTP status
-                # code, not Groq's actual JSON error body (model_decommissioned,
-                # invalid_api_key, rate_limit_exceeded, etc). Capture the body
-                # explicitly and print it so it lands in Streamlit Cloud logs.
-                try:
-                    detail = response.json()
-                except Exception:
-                    detail = response.text
-                print(f"[GROQ ERROR] status={response.status_code} body={detail}", flush=True)
-                return f"__LLM_ERROR__:Groq HTTP {response.status_code}: {detail}"
-
-            data = response.json()
-            return data["choices"][0]["message"]["content"].strip()
-        except requests.exceptions.Timeout as e:
-            print(f"[GROQ ERROR] timeout: {e}", flush=True)
-            return f"__LLM_ERROR__:timeout: {e}"
-        except requests.exceptions.ConnectionError as e:
-            print(f"[GROQ ERROR] connection error: {e}", flush=True)
-            return f"__LLM_ERROR__:connection error: {e}"
-        except Exception as e:
-            print(f"[GROQ ERROR] unexpected: {type(e).__name__}: {e}", flush=True)
-            return f"__LLM_ERROR__:{type(e).__name__}: {e}"
+        models_to_try = [CONFIG["LLM_MODEL_NAME"]] + CONFIG.get("LLM_MODEL_FALLBACKS", [])
+        last_error = None
+        for model_name in models_to_try:
+            text, err = _call_groq_once(model_name, prompt, temperature, max_tokens, seed)
+            if text is not None:
+                if model_name != CONFIG["LLM_MODEL_NAME"]:
+                    print(f"[GROQ] fell back to model={model_name} successfully", flush=True)
+                return text
+            last_error = err
+            if not err.get("model_dead"):
+                # Real failure (timeout, rate limit, auth, etc) — trying
+                # another model name won't fix it, stop here.
+                break
+        return f"__LLM_ERROR__:Groq HTTP {last_error.get('status')}: {last_error.get('detail')}"
 
     # Fallback: local Ollama server
     try:
@@ -281,11 +324,28 @@ def detect_language(text):
         return "unknown"
 
 
+def _looks_like_translation_failure(original, translated):
+    """deep-translator scrapes the public Google Translate page. When
+    Google blocks/rate-limits the request it sometimes returns the text
+    of an HTML error page instead of raising — e.g. 'Error 500 (Server
+    Error)!!1...'. Using that as a retrieval query silently ruins
+    results, so detect and reject it."""
+    if not translated or not translated.strip():
+        return True
+    bad_markers = ("Error 500", "Error 404", "Server Error", "That’s an error", "That's an error")
+    return any(marker.lower() in translated.lower() for marker in bad_markers)
+
+
 def translate_to_english(text):
     try:
         from deep_translator import GoogleTranslator
-        return GoogleTranslator(source="auto", target="en").translate(text)
-    except Exception:
+        result = GoogleTranslator(source="auto", target="en").translate(text)
+        if _looks_like_translation_failure(text, result):
+            print(f"[TRANSLATE] suspicious output, falling back to original text: {result!r}", flush=True)
+            return text
+        return result
+    except Exception as e:
+        print(f"[TRANSLATE] translate_to_english failed: {e}", flush=True)
         return text
 
 
@@ -294,8 +354,13 @@ def translate_to_arabic(text):
         return ""
     try:
         from deep_translator import GoogleTranslator
-        return GoogleTranslator(source="auto", target="ar").translate(text)
-    except Exception:
+        result = GoogleTranslator(source="auto", target="ar").translate(text)
+        if _looks_like_translation_failure(text, result):
+            print(f"[TRANSLATE] suspicious output, falling back to original text: {result!r}", flush=True)
+            return text
+        return result
+    except Exception as e:
+        print(f"[TRANSLATE] translate_to_arabic failed: {e}", flush=True)
         return text
 
 
