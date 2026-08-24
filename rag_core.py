@@ -315,6 +315,9 @@ def correct_user_query(query, use_llm=True):
     )
     corrected = _call_llm(prompt, temperature=0.0, max_tokens=100)
     if corrected.startswith("__LLM_ERROR__"):
+        # كان بيفشل بصمت تمامًا من غير أي أثر — دلوقتي بيتسجل في اللوجز
+        # عشان تعرف لو السبب رفض الموديل أو rate limit أو حاجة تانية.
+        print(f"[CORRECT_QUERY] LLM correction failed, using original text: {corrected}", flush=True)
         return query, False
     corrected = corrected.strip().strip('"')
     if corrected and corrected.lower() != query.lower():
@@ -459,6 +462,16 @@ def build_context_package(query, reranked_df, max_context_chunks=None, word_budg
 
     candidates = reranked_df[reranked_df["rerank_score"] >= min_chunk_score].copy()
     rejected_count = len(reranked_df) - len(candidates)
+
+    # ديباج ثابت وواضح: كل سؤال هيسجل نطاق الدرجات الفعلي والعتبة
+    # المستخدمة وعدد المصادر اللي فضلت، عشان أي مشكلة "no_sources" تبقى
+    # قابلة للتشخيص من اللوجز فورًا بدل التخمين.
+    top_scores = reranked_df["rerank_score"].round(2).tolist() if not reranked_df.empty else []
+    print(
+        f"[RETRIEVAL] query={query!r} min_chunk_score={min_chunk_score} "
+        f"top_scores={top_scores} kept={len(candidates)}/{len(reranked_df)}",
+        flush=True,
+    )
 
     if candidates.empty:
         return {
